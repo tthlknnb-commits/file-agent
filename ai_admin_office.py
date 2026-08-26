@@ -12,7 +12,9 @@ from document_writer import write_docx, write_text
 from file_reader import Evidence, read_paths
 from file_search import search_evidence
 from product_engine import PRODUCT_SPECS, ProductEngine
+from request_router import route_request
 from source_control import assess_web_source
+from web_research import search_web
 
 PRODUCTS = {
     "báo cáo": "REPORT", "bao cao": "REPORT", "report": "REPORT",
@@ -133,16 +135,35 @@ def _source_rows(sources: list[Source]) -> list[dict[str, Any]]:
 def process(request: str, local_paths: list[str] | None = None, web_urls: list[str] | None = None,
             explicit_product: str | None = None, output_dir: str | None = None,
             search_query: str | None = None, output_format: str = "docx") -> ProcessResult:
-    """Controlled workflow: sources -> authority -> evidence -> product plan/draft -> QC -> output."""
+    """Natural-language controlled workflow with authorized local paths and optional web research."""
+    routed = route_request(request)
+    local_paths = list(local_paths) if local_paths is not None else routed.local_paths
+    web_urls = list(web_urls) if web_urls is not None else routed.web_urls
     issues: list[Issue] = []
-    sources = discover_local_sources(local_paths or [])
-    sources.extend(fetch_web_sources(web_urls or []))
+
+    sources = discover_local_sources(local_paths)
+
+    if routed.needs_web_research and not web_urls:
+        try:
+            research = search_web(routed.research_query or request, max_results=5, official_only=True)
+            web_urls = [item.url for item in research]
+        except Exception as exc:
+            issues.append(Issue("MAJOR", "WEB_RESEARCH_UNAVAILABLE",
+                                f"Không thực hiện được tìm kiếm Internet tự động: {exc}",
+                                recommendation="Cung cấp URL nguồn chính thống hoặc thử lại khi môi trường có Internet."))
+
+    sources.extend(fetch_web_sources(web_urls))
     issues.extend(source_issues(sources))
     product, product_issues = classify_product(request, explicit_product)
     issues.extend(product_issues)
+
     if not sources:
-        issues.append(Issue("MAJOR", "NO_SOURCES", "Chưa tìm thấy tài liệu nguồn trong vị trí đã chỉ định.", recommendation="Kiểm tra đường dẫn hoặc cung cấp nguồn dữ liệu."))
-    hits = search_evidence([Evidence(s.uri, s.title, s.source_type, s.locator, s.content, s.sha256, s.status) for s in sources], search_query or request) if sources else []
+        issues.append(Issue("MAJOR", "NO_SOURCES", "Chưa tìm thấy tài liệu nguồn trong vị trí đã chỉ định.", recommendation="Chỉ định file/thư mục cần đọc hoặc xác nhận cho phép nghiên cứu Internet."))
+
+    hits = search_evidence(
+        [Evidence(s.uri, s.title, s.source_type, s.locator, s.content, s.sha256, s.status) for s in sources],
+        search_query or request,
+    ) if sources else []
     if not hits and sources and search_query:
         issues.append(Issue("MINOR", "NO_SEARCH_HITS", "Không tìm thấy đoạn dữ liệu khớp truy vấn; không được tự suy đoán dữ liệu."))
 
@@ -166,6 +187,9 @@ def process(request: str, local_paths: list[str] | None = None, web_urls: list[s
 
     metadata = {
         "workflow": "INPUT→IDENTIFY→INTENT_LOCK→CLASSIFY→SOURCE_DISCOVERY→AUTHORITY_CHECK→EVIDENCE_LEDGER→CHECK→PLAN→EXECUTE→INTEGRATE→QC→DECISION→OUTPUT",
+        "authorized_local_paths": local_paths,
+        "web_urls": web_urls,
+        "web_research_requested": routed.needs_web_research,
         "output_file": str(output_file) if output_file else None,
         "source_count": len(sources),
         "search_hit_count": len(hits),
