@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -12,6 +11,7 @@ from typing import Any
 from document_writer import write_docx, write_text
 from file_reader import Evidence, read_paths
 from file_search import search_evidence
+from source_control import assess_web_source
 
 PRODUCTS = {
     "báo cáo": "REPORT", "bao cao": "REPORT", "report": "REPORT",
@@ -68,6 +68,7 @@ def discover_local_sources(paths: list[str], recursive: bool = True) -> list[Sou
 def fetch_web_sources(urls: list[str]) -> list[Source]:
     results: list[Source] = []
     for url in urls:
+        assessment = assess_web_source(url)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "AI-Admin-Office/1.0"})
             with urllib.request.urlopen(req, timeout=20) as response:
@@ -75,7 +76,10 @@ def fetch_web_sources(urls: list[str]) -> list[Source]:
                 content_type = response.headers.get_content_type()
                 if content_type.startswith("text/") or content_type in {"application/json", "application/xml"}:
                     content = raw.decode("utf-8", errors="replace")
-                    results.append(Source(url, url, content, "WEB", "UNVERIFIED", sha256=hashlib.sha256(content.encode()).hexdigest()))
+                    results.append(Source(url, url, content, "WEB", assessment.status,
+                                          sha256=hashlib.sha256(content.encode()).hexdigest()))
+                else:
+                    results.append(Source(url, url, "UNSUPPORTED_CONTENT_TYPE", "WEB", "UNVERIFIED"))
         except Exception as exc:
             results.append(Source(url, url, f"FETCH_ERROR: {exc}", "WEB", "UNVERIFIED"))
     return results
@@ -90,6 +94,17 @@ def classify_product(request: str, explicit_product: str | None = None) -> tuple
     if len(matches) > 1:
         return None, [Issue("CRITICAL", "AMBIGUOUS_PRODUCT", "Có nhiều loại sản phẩm có thể làm thay đổi đầu ra; cần xác nhận.", recommendation="Xác nhận loại sản phẩm cần tạo.")]
     return None, [Issue("CRITICAL", "MISSING_PRODUCT", "Chưa xác định được loại sản phẩm.", recommendation="Nêu rõ sản phẩm cần tạo.")]
+
+
+def source_issues(sources: list[Source]) -> list[Issue]:
+    issues: list[Issue] = []
+    for source in sources:
+        if source.source_type == "WEB" and source.status != "CONFIRMED":
+            issues.append(Issue("MAJOR", "UNVERIFIED_WEB_SOURCE",
+                                f"Nguồn Internet chưa được xác định là nguồn chính thống: {source.uri}",
+                                location=source.uri,
+                                recommendation="Kiểm tra nguồn chính thống trước khi dùng để khẳng định thể thức, pháp lý hoặc sự kiện."))
+    return issues
 
 
 def _decision(issues: list[Issue]) -> str:
@@ -109,10 +124,11 @@ def _source_rows(sources: list[Source]) -> list[dict[str, Any]]:
 def process(request: str, local_paths: list[str] | None = None, web_urls: list[str] | None = None,
             explicit_product: str | None = None, output_dir: str | None = None,
             search_query: str | None = None, output_format: str = "docx") -> ProcessResult:
-    """Controlled workflow: user-authorized sources -> evidence -> product -> QC -> output."""
+    """Controlled workflow: authorized sources -> authority check -> evidence -> product -> QC -> output."""
     issues: list[Issue] = []
     sources = discover_local_sources(local_paths or [])
     sources.extend(fetch_web_sources(web_urls or []))
+    issues.extend(source_issues(sources))
     product, product_issues = classify_product(request, explicit_product)
     issues.extend(product_issues)
     if not sources:
@@ -132,13 +148,14 @@ def process(request: str, local_paths: list[str] | None = None, web_urls: list[s
             content += "\nDỮ LIỆU THAM CHIẾU:\n" + "\n".join(f"- {h.title} ({h.locator or 'document'}): {h.excerpt}" for h in hits[:10])
         if output_dir:
             out_dir = Path(output_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_file = out_dir / f"AI_Admin_Office_{stamp}.{output_format.lstrip('.') }"
             if output_format.lower() == "docx":
                 write_docx(content, output_file, f"{product or 'AI ADMIN OFFICE'}")
             else:
                 write_text(content, output_file)
-    metadata = {"workflow": "INPUT→IDENTIFY→INTENT_LOCK→CLASSIFY→SOURCE_DISCOVERY→EVIDENCE_LEDGER→CHECK→PLAN→EXECUTE→INTEGRATE→QC→DECISION→OUTPUT",
+    metadata = {"workflow": "INPUT→IDENTIFY→INTENT_LOCK→CLASSIFY→SOURCE_DISCOVERY→AUTHORITY_CHECK→EVIDENCE_LEDGER→CHECK→PLAN→EXECUTE→INTEGRATE→QC→DECISION→OUTPUT",
                 "output_file": str(output_file) if output_file else None,
                 "source_count": len(sources), "search_hit_count": len(hits)}
     return ProcessResult(product, decision, status, content, _source_rows(sources), [asdict(i) for i in issues], metadata)
