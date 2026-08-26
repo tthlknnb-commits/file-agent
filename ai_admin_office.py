@@ -11,6 +11,7 @@ from typing import Any
 from document_writer import write_docx, write_text
 from file_reader import Evidence, read_paths
 from file_search import search_evidence
+from product_engine import ProductEngine
 from source_control import assess_web_source
 
 PRODUCTS = {
@@ -18,7 +19,7 @@ PRODUCTS = {
     "kế hoạch": "PLAN", "ke hoach": "PLAN", "plan": "PLAN",
     "tờ trình": "PROPOSAL", "to trinh": "PROPOSAL", "proposal": "PROPOSAL",
     "công văn": "OFFICIAL_LETTER", "cong van": "OFFICIAL_LETTER",
-    "quyết định": "DECISION", "quyet dinh": "DECISION",
+    "quyết định": "DECISION", "quyet dinh": "DECISION", "decision": "DECISION",
     "thông báo": "NOTICE", "thong bao": "NOTICE",
     "biên bản": "MINUTES", "bien ban": "MINUTES",
     "bài phát biểu": "SPEECH", "bai phat bieu": "SPEECH", "speech": "SPEECH",
@@ -28,6 +29,7 @@ PRODUCTS = {
     "tập huấn": "TRAINING", "tap huan": "TRAINING", "training": "TRAINING",
     "phân tích": "ANALYSIS", "phan tich": "ANALYSIS", "analysis": "ANALYSIS",
 }
+
 
 @dataclass
 class Source:
@@ -40,6 +42,7 @@ class Source:
     locator: str | None = None
     sha256: str = ""
 
+
 @dataclass
 class Issue:
     severity: str
@@ -47,6 +50,7 @@ class Issue:
     message: str
     location: str | None = None
     recommendation: str | None = None
+
 
 @dataclass
 class ProcessResult:
@@ -87,7 +91,10 @@ def fetch_web_sources(urls: list[str]) -> list[Source]:
 
 def classify_product(request: str, explicit_product: str | None = None) -> tuple[str | None, list[Issue]]:
     if explicit_product:
-        return explicit_product.upper(), []
+        product = explicit_product.upper()
+        if product in ProductEngine().validate(product):
+            return None, [Issue("CRITICAL", "UNKNOWN_PRODUCT", f"Loại sản phẩm không được hỗ trợ: {product}")]
+        return product, []
     matches = {product for phrase, product in PRODUCTS.items() if phrase in request.lower()}
     if len(matches) == 1:
         return next(iter(matches)), []
@@ -124,7 +131,7 @@ def _source_rows(sources: list[Source]) -> list[dict[str, Any]]:
 def process(request: str, local_paths: list[str] | None = None, web_urls: list[str] | None = None,
             explicit_product: str | None = None, output_dir: str | None = None,
             search_query: str | None = None, output_format: str = "docx") -> ProcessResult:
-    """Controlled workflow: authorized sources -> authority check -> evidence -> product -> QC -> output."""
+    """Controlled workflow: sources -> authority -> evidence -> product plan/draft -> QC -> output."""
     issues: list[Issue] = []
     sources = discover_local_sources(local_paths or [])
     sources.extend(fetch_web_sources(web_urls or []))
@@ -136,28 +143,32 @@ def process(request: str, local_paths: list[str] | None = None, web_urls: list[s
     hits = search_evidence([Evidence(s.uri, s.title, s.source_type, s.locator, s.content, s.sha256, s.status) for s in sources], search_query or request) if sources else []
     if not hits and sources and search_query:
         issues.append(Issue("MINOR", "NO_SEARCH_HITS", "Không tìm thấy đoạn dữ liệu khớp truy vấn; không được tự suy đoán dữ liệu."))
+
     decision = _decision(issues)
     status = "WORKING" if decision == "PASS" else "REVIEW" if decision == "NEEDS_INPUT" else "DRAFT"
     content = ""
     output_file = None
-    if decision != "BLOCKED":
-        content = (f"AI ADMIN OFFICE\nSản phẩm: {product}\n\nYêu cầu: {request}\n\n"
-                   "Nội dung nguồn được thu thập và kiểm soát theo Evidence Ledger. "
-                   "Chưa tự tạo dữ kiện nghiệp vụ chưa có trong nguồn.\n")
-        if hits:
-            content += "\nDỮ LIỆU THAM CHIẾU:\n" + "\n".join(f"- {h.title} ({h.locator or 'document'}): {h.excerpt}" for h in hits[:10])
+    if decision != "BLOCKED" and product:
+        engine = ProductEngine()
+        evidence_rows = [{"title": h.title, "uri": h.source_uri, "locator": h.locator} for h in hits[:20]]
+        content = engine.integrate(engine.execute(product, request, evidence_rows), product)
         if output_dir:
             out_dir = Path(output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = out_dir / f"AI_Admin_Office_{stamp}.{output_format.lstrip('.') }"
+            output_file = out_dir / f"AI_Admin_Office_{product}_{stamp}.{output_format.lstrip('.') }"
             if output_format.lower() == "docx":
-                write_docx(content, output_file, f"{product or 'AI ADMIN OFFICE'}")
+                write_docx(content, output_file, engine.identify(product).title)
             else:
                 write_text(content, output_file)
-    metadata = {"workflow": "INPUT→IDENTIFY→INTENT_LOCK→CLASSIFY→SOURCE_DISCOVERY→AUTHORITY_CHECK→EVIDENCE_LEDGER→CHECK→PLAN→EXECUTE→INTEGRATE→QC→DECISION→OUTPUT",
-                "output_file": str(output_file) if output_file else None,
-                "source_count": len(sources), "search_hit_count": len(hits)}
+
+    metadata = {
+        "workflow": "INPUT→IDENTIFY→INTENT_LOCK→CLASSIFY→SOURCE_DISCOVERY→AUTHORITY_CHECK→EVIDENCE_LEDGER→CHECK→PLAN→EXECUTE→INTEGRATE→QC→DECISION→OUTPUT",
+        "output_file": str(output_file) if output_file else None,
+        "source_count": len(sources),
+        "search_hit_count": len(hits),
+        "product_plan": ProductEngine().plan(product) if product in ProductEngine().identify.__annotations__.get("return", {}) else [],
+    }
     return ProcessResult(product, decision, status, content, _source_rows(sources), [asdict(i) for i in issues], metadata)
 
 
