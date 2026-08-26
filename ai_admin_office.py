@@ -11,7 +11,7 @@ from typing import Any
 from document_writer import write_docx, write_text
 from file_reader import Evidence, read_paths
 from file_search import search_evidence
-from product_engine import ProductEngine
+from product_engine import PRODUCT_SPECS, ProductEngine
 from source_control import assess_web_source
 
 PRODUCTS = {
@@ -90,9 +90,11 @@ def fetch_web_sources(urls: list[str]) -> list[Source]:
 
 
 def classify_product(request: str, explicit_product: str | None = None) -> tuple[str | None, list[Issue]]:
+    engine = ProductEngine()
     if explicit_product:
         product = explicit_product.upper()
-        if product in ProductEngine().validate(product):
+        errors = engine.validate(product)
+        if errors:
             return None, [Issue("CRITICAL", "UNKNOWN_PRODUCT", f"Loại sản phẩm không được hỗ trợ: {product}")]
         return product, []
     matches = {product for phrase, product in PRODUCTS.items() if phrase in request.lower()}
@@ -148,8 +150,8 @@ def process(request: str, local_paths: list[str] | None = None, web_urls: list[s
     status = "WORKING" if decision == "PASS" else "REVIEW" if decision == "NEEDS_INPUT" else "DRAFT"
     content = ""
     output_file = None
+    engine = ProductEngine()
     if decision != "BLOCKED" and product:
-        engine = ProductEngine()
         evidence_rows = [{"title": h.title, "uri": h.source_uri, "locator": h.locator} for h in hits[:20]]
         content = engine.integrate(engine.execute(product, request, evidence_rows), product)
         if output_dir:
@@ -167,7 +169,7 @@ def process(request: str, local_paths: list[str] | None = None, web_urls: list[s
         "output_file": str(output_file) if output_file else None,
         "source_count": len(sources),
         "search_hit_count": len(hits),
-        "product_plan": ProductEngine().plan(product) if product in ProductEngine().identify.__annotations__.get("return", {}) else [],
+        "product_plan": engine.plan(product) if product in PRODUCT_SPECS else [],
     }
     return ProcessResult(product, decision, status, content, _source_rows(sources), [asdict(i) for i in issues], metadata)
 
